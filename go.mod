@@ -8,5 +8,9 @@ require (
 	github.com/synerex/proto_storage v0.0.2
 	github.com/synerex/synerex_api v0.4.2
 	github.com/synerex/synerex_proto v0.1.9
-	github.com/synerex/synerex_sxutil v0.4.12
+	github.com/synerex/synerex_sxutil v0.5.2
+//		local.packages/synerex_sxutil v0.4.12
+
 )
+
+//replace local.packages/synerex_sxutil => ../../synerex_beta/sxutil

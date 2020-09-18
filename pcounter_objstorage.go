@@ -11,11 +11,12 @@ import (
 	storage "github.com/synerex/proto_storage"
 	api "github.com/synerex/synerex_api"
 	pbase "github.com/synerex/synerex_proto"
+
 	sxutil "github.com/synerex/synerex_sxutil"
+	//sxutil "local.packages/synerex_sxutil"
 
 	"log"
 	"sync"
-	"time"
 )
 
 // datastore provider provides Datastore Service.
@@ -27,9 +28,16 @@ var (
 	version         = "0.01"
 	baseDir         = "store"
 	dataDir         string
+	pcMu            *sync.Mutex = nil
+	pcLoop          *bool       = nil
+	ssMu            *sync.Mutex = nil
+	ssLoop          *bool       = nil
 	sxServerAddress string
+	currentNid      uint64                  = 0 // NotifyDemand message ID
 	mbusID          uint64                  = 0 // storage MBus ID
+	storageID       uint64                  = 0 // storageID
 	pc_client       *sxutil.SXServiceClient = nil
+	st_client       *sxutil.SXServiceClient = nil
 )
 
 func init() {
@@ -38,8 +46,26 @@ func init() {
 func objStore(bc string, ob string, dt string) {
 
 	log.Printf("Store %s, %s, %s", bc, ob, dt)
+	//  we need to send data into mbusID.
+	record := storage.Record{
+		BucketName: bc,
+		ObjectName: ob,
+		Record:     []byte(dt),
+	}
+	out, err := proto.Marshal(&record)
+	if err == nil && mbusID != 0 {
+		cont := &api.Content{Entity: out}
+		msg := &api.MbusMsg{
+			MsgInfo:  "Store", // command
+			TargetId: storageID,
+			Cdata:    cont,
+		}
+		st_client.SendMbusMsg(context.Background(), msg)
+	}
+
 }
 
+// called for each agent data.
 func supplyPCounterCallback(clt *sxutil.SXServiceClient, sp *api.Supply) {
 
 	pc := &pcounter.PCounter{}
@@ -79,62 +105,69 @@ func supplyPCounterCallback(clt *sxutil.SXServiceClient, sp *api.Supply) {
 	}
 }
 
-func reconnectClient(client *sxutil.SXServiceClient) {
-	mu.Lock()
-	if client.Client != nil {
-		client.Client = nil
-		log.Printf("Client reset \n")
-	}
-	mu.Unlock()
-	time.Sleep(5 * time.Second) // wait 5 seconds to reconnect
-	mu.Lock()
-	if client.Client == nil {
-		newClt := sxutil.GrpcConnectServer(sxServerAddress)
-		if newClt != nil {
-			log.Printf("Reconnect server [%s]\n", sxServerAddress)
-			client.Client = newClt
-		}
-	} else { // someone may connect!
-		log.Printf("Use reconnected server\n", sxServerAddress)
-	}
-	mu.Unlock()
+func subscribePCounterSupply(client *sxutil.SXServiceClient) {
+	log.Printf("Start PCounter Supply")
+
+	pcMu, pcLoop = sxutil.SimpleSubscribeSupply(client, supplyPCounterCallback)
+
 }
 
-func subscribePCounterSupply(client *sxutil.SXServiceClient) {
-	ctx := context.Background() //
-	for {                       // make it continuously working..
-		client.SubscribeSupply(ctx, supplyPCounterCallback)
-		log.Print("Error on subscribe")
-		reconnectClient(client)
-	}
+func mbusCallback(clt *sxutil.SXServiceClient, mm *api.MbusMsg) {
+	log.Printf("Mbus message %#v", mm)
+
+	/*
+		if sxutil.IDType(mm.TargetId) == clt.ClientID { // this msg is for me.
+			if mm.MsgInfo == "Store" {
+				record := &storage.Record{}
+				err := proto.Unmarshal(mm.Cdata.Entity, record)
+				if err == nil {
+				}
+			}
+		}
+	*/
+
 }
 
 func supplyStorageCallback(clt *sxutil.SXServiceClient, sp *api.Supply) {
-	storageInfo := &storage.Storage{}
-
+	//	log.Printf("Receive Supply! %v", sp)
 	if sp.SupplyName == "Storage" {
-		err := proto.Unmarshal(sp.Cdata.Entity, storageInfo)
-		if err == nil { /// lets start subscribe pcounter.
-			log.Printf("Send Select Supply! %v", sp)
-			mbusID, _ = clt.SelectSupply(sp)
-			//			if sserr != nil {
-			//				mbusID = -1
-			//				return
-			//			}
-			// start store with mbus.
-			go subscribePCounterSupply(pc_client)
+		storageInfo := &storage.Storage{}
+		// propose supply!?
+		if sp.TargetId != 0 {
+			if currentNid == sp.TargetId {
+				// should check with previous one
+				log.Printf("Receive ProposeSupply! %d %v", sp.TargetId, sp)
+				err := proto.Unmarshal(sp.Cdata.Entity, storageInfo)
+				if err == nil { /// lets start subscribe pcounter.
+					// check handling function.
+					if storageInfo.Stype == storage.StorageType_TYPE_OBJSTORE && storageInfo.Dtype == storage.DataType_DATA_FILE {
+						log.Printf("Type OK")
+						log.Printf("Send Select Supply! %v", sp)
+						mbusID, err = clt.SelectSupply(sp)
+						storageID = sp.SenderId
+						if err != nil {
+							log.Printf("SelectSupply err:%v", err)
+							//				return
+						} else {
+							// start store with mbus.
+
+							go clt.SubscribeMbus(context.Background(), mbusCallback)
+							subscribePCounterSupply(pc_client)
+						}
+					} else {
+						log.Printf("Unknown storage type/data %v", storageInfo)
+					}
+				} else {
+					log.Printf("Cdata Content is broken %v", err)
+				}
+			}
 		}
 	}
 
 }
 
 func subscribeStorageSupply(client *sxutil.SXServiceClient) {
-	ctx := context.Background() //
-	for {                       // make it continuously working..
-		client.SubscribeSupply(ctx, supplyStorageCallback)
-		log.Print("Error on subscribe")
-		reconnectClient(client)
-	}
+
 }
 
 func main() {
@@ -162,15 +195,14 @@ func main() {
 
 	if client == nil {
 		log.Fatal("Can't connect Synerex Server")
-	} else {
-		log.Print("Connecting SynerexServer")
 	}
 
-	st_client := sxutil.NewSXServiceClient(client, pbase.STORAGE_SERVICE, "{Client:PCObjStore}")
-	//	pc_client = sxutil.NewSXServiceClient(client, pbase.PEOPLE_COUNTER_SVC, "{Client:PcountStore}")
+	st_client = sxutil.NewSXServiceClient(client, pbase.STORAGE_SERVICE, "{Client:PCObjStore}")
+	pc_client = sxutil.NewSXServiceClient(client, pbase.PEOPLE_COUNTER_SVC, "{Client:PcountStore}")
 
 	log.Print("Subscribe Storage Supply")
-	go subscribeStorageSupply(st_client)
+	ssMu, ssLoop = sxutil.SimpleSubscribeSupply(st_client, supplyStorageCallback)
+	wg.Add(1)
 
 	storageInfo := storage.Storage{
 		Stype: storage.StorageType_TYPE_OBJSTORE,
@@ -187,13 +219,14 @@ func main() {
 		}
 		//			fmt.Printf("Res: %v",smo)
 		//_, nerr :=
-		log.Printf("Sending Notify Demend!")
-		st_client.NotifyDemand(&dmo)
+		currentNid, err = st_client.NotifyDemand(&dmo)
+		if err == nil {
+			log.Printf("Sending Notify Demand! %d", currentNid)
+		} else {
+			log.Printf("Notify Demend Send Error! %v", err)
+		}
 	}
 
-	log.Printf("umm")
-
-	wg.Add(1)
 	//	log.Print("Subscribe Supply")
 	//	go subscribePCounterSupply(pc_client)
 
